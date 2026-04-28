@@ -131,7 +131,39 @@ def _states_equal(new_state, row_ptr: torch.Tensor, columns: torch.Tensor, tau: 
     )
 
 
-def _benchmark_workload(graph_file: Path, update_file: Path, *, repeat: int, warmup: int, edge_budget: int):
+def _profile_columns(result) -> dict[str, int | float]:
+    keys = [
+        "num_cone_edges",
+        "num_active_rounds",
+        "num_active_edges_total",
+        "num_active_edges_max",
+        "num_active_edges_avg",
+        "num_enqueue_total",
+        "num_enqueue_without_tighten",
+        "ratio_enqueue_without_tighten",
+        "num_tighten_L",
+        "num_tighten_U",
+        "num_triangle_records_scanned",
+        "num_unique_triangle_records_scanned",
+        "ratio_triangle_records_repeated",
+        "num_repeated_scan_same_edge",
+        "num_repeated_scan_same_edge_level",
+        "num_2hop_backfill_edges",
+        "ratio_2hop_backfill_edges_to_cone",
+        "num_exact_peeling_edges",
+    ]
+    return {key: result.stats.profile.get(key, 0) for key in keys}
+
+
+def _benchmark_workload(
+    graph_file: Path,
+    update_file: Path,
+    *,
+    repeat: int,
+    warmup: int,
+    edge_budget: int,
+    enable_refinement: bool,
+):
     desktop_dcd, dcd_maintain, decompose_from_csr, device, load_graph_as_csr, read_update_edge_txt = _load_desktop_modules()
 
     new_state = load_graph_from_txt(str(graph_file), device=device)
@@ -150,7 +182,13 @@ def _benchmark_workload(graph_file: Path, update_file: Path, *, repeat: int, war
         return _count_desktop_truss_traversal(desktop_dcd, counter if counter is not None else TraversalCounter())
 
     new_delete, new_delete_times, new_delete_counter = _measure(
-        lambda: maintain_dcd(new_state, DeltaGraph(del_edges=update_edges), device=device, edge_budget=edge_budget),
+        lambda: maintain_dcd(
+            new_state,
+            DeltaGraph(del_edges=update_edges),
+            device=device,
+            edge_budget=edge_budget,
+            enable_refinement=enable_refinement,
+        ),
         new_counter_context,
         repeat=repeat,
         warmup=warmup,
@@ -176,6 +214,7 @@ def _benchmark_workload(graph_file: Path, update_file: Path, *, repeat: int, war
             "new_edge_visits": new_delete_counter.edge_visits,
             "new_triangle_records": new_delete_counter.triangle_records,
             "new_triangle_calls": new_delete_counter.triangle_calls,
+            **_profile_columns(new_delete),
             "desktop_candidate_edges": int(torch.count_nonzero(desktop_delete[3].cand).item()),
             "desktop_unresolved_edges": int(desktop_delete[3].unresolved_edges.numel()),
             "desktop_fallback": bool(desktop_delete[3].fallback_used),
@@ -186,7 +225,13 @@ def _benchmark_workload(graph_file: Path, update_file: Path, *, repeat: int, war
     ]
 
     new_insert, new_insert_times, new_insert_counter = _measure(
-        lambda: maintain_dcd(new_delete.state, DeltaGraph(ins_edges=update_edges), device=device, edge_budget=edge_budget),
+        lambda: maintain_dcd(
+            new_delete.state,
+            DeltaGraph(ins_edges=update_edges),
+            device=device,
+            edge_budget=edge_budget,
+            enable_refinement=enable_refinement,
+        ),
         new_counter_context,
         repeat=repeat,
         warmup=warmup,
@@ -217,6 +262,7 @@ def _benchmark_workload(graph_file: Path, update_file: Path, *, repeat: int, war
             "new_edge_visits": new_insert_counter.edge_visits,
             "new_triangle_records": new_insert_counter.triangle_records,
             "new_triangle_calls": new_insert_counter.triangle_calls,
+            **_profile_columns(new_insert),
             "desktop_candidate_edges": int(torch.count_nonzero(desktop_insert[3].cand).item()),
             "desktop_unresolved_edges": int(desktop_insert[3].unresolved_edges.numel()),
             "desktop_fallback": bool(desktop_insert[3].fallback_used),
@@ -236,6 +282,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--edge-budget", type=int, default=200_000)
+    parser.add_argument("--enable-refinement", action="store_true")
     parser.add_argument("--csv", default="new_dcd_vs_desktop_truss.csv")
     args = parser.parse_args()
 
@@ -249,6 +296,7 @@ def main() -> None:
                 repeat=args.repeat,
                 warmup=args.warmup,
                 edge_budget=args.edge_budget,
+                enable_refinement=args.enable_refinement,
             )
             all_rows.extend(rows)
             for row in rows:
@@ -261,6 +309,10 @@ def main() -> None:
                     f"ok={row['ok']}",
                     f"new_edge_visits={row['new_edge_visits']}",
                     f"new_tri_records={row['new_triangle_records']}",
+                    f"cone={row['num_cone_edges']}",
+                    f"enqueue/no_tighten={row['ratio_enqueue_without_tighten']:.3f}",
+                    f"tri_repeat={row['ratio_triangle_records_repeated']:.3f}",
+                    f"backfill/cone={row['ratio_2hop_backfill_edges_to_cone']:.3f}",
                     f"desktop_edge_visits={row['desktop_edge_visits']}",
                     f"desktop_tri_records={row['desktop_triangle_records']}",
                     f"desktop_fallback={row['desktop_fallback']}",
