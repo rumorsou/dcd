@@ -1,0 +1,93 @@
+当前已保留并验证有效的优化
+
+1. 读图与编号映射
+- 新增 `read_base_graph_txt()`，读取基础图时不删除 leaf 边，保留所有原始顶点。
+- `read_update_edge_txt()` 使用 `np.searchsorted` 做批量顶点编号映射，替代 Python 字典逐条查找。
+- 更新边读取阶段统一做：
+  self-loop 过滤、端点升序规范化、去重。
+
+2. 图结构与双向邻接
+- `load_graph_as_csr()` 在读图后同时构建并返回 `bidirectional_view`，避免后续重复准备双向邻接。
+- 双向邻接视图记录 `(u,v)` 和 `(v,u)`，但两个方向共享同一个无向 `edge_id`，因此不破坏现有 `truss_result` 语义。
+- `_build_bidirectional_view()` 已优化为：
+  不再对 2m 条方向边整体排序，而是通过入邻居/出邻居分块定位构建。
+
+3. 局部三角形收集
+- 新增 `_collect_edge_triangles()`，替代维护流程中对全图 `calculate_support3()` 的依赖。
+- 该函数现在基于双向邻接视图收集“包含某条边的全部三角形”，覆盖完整 incident triangle。
+- 支持 `query_src/query_dst`，可直接为 overlay 插入边收集三角形。
+- 匹配逻辑已优化为：
+  每个 chunk 只对 `u_codes` 排序一次，再用 `searchsorted` 匹配 `v_codes`，去掉 `sort_isin` 的额外开销。
+
+4. 插入维护优化
+- `superior_insert()` 的临时阶段不再真实把全部 `remaining_edges` merge 进一张临时 CSR。
+- 改为：
+  通过 `_augment_bidirectional_view()` 构造 overlay 视图，
+  仅为临时插入边分配 overlay `edge_id`，
+  然后在该视图上计算 pre-truss 和 EST。
+- `insert_edges_csr(..., return_bidirectional_view=True)` 在真正插入后直接返回：
+  新 CSR、更新后的 `truss_result`、新的 `edge_code`、新的 `bidirectional_view`，
+  避免外层再次重建这些结构。
+
+5. 删除维护优化
+- `remove_edges_csr(..., return_bidirectional_view=True, bidirectional_view=...)`
+  支持在删除后直接返回过滤后的双向视图。
+- 新增 `_filter_bidirectional_view()`，通过旧图 `keep_mask` 过滤并重编号双向邻接，避免删除后整图重建双向视图。
+
+6. 遍历阶段优化
+- `insertion_traverse()` / `removal_traverse()` 改为使用局部三角形和局部 support 计算。
+- `_compute_ts_for_edges()` 仅返回目标边集上的局部 `ts`，不再每次分配全长 support 向量。
+- 新增 `edge_id -> src` 的预构建索引 `_build_edge_src_index()`，
+  `_collect_edge_triangles()` 不再反复用 `searchsorted(row_ptr[1:], edge_id)` 回查源点，而是直接索引源点。
+- `insertion_traverse()` 改为增量维护：
+  已访问边集 `tracked_edges` 及其局部三角形包会被直接复用，
+  每轮只为 `next_frontier` 新增边补算局部三角形，不再对整包候选边重复 `_collect_edge_triangles()`。
+- `removal_traverse()` 同样复用了候选边三角形包，
+  对新的 `current` 直接用已有局部映射筛选三角形，减少重复局部查询。
+- 新增 `_compute_ts_local_with_support_mask()`，
+  在一次 traverse 内复用可增量更新的 `valid_support_mask`，
+  避免 `_compute_ts_local_packed()` 每轮都整图重建
+  `(truss_result > k) | ((truss_result == k) & (~evicted_mask))`。
+- `insertion_traverse()` 增加提前退出：
+  当前 `frontier` 若已无法扩出新的 `next_frontier`，则直接结束，
+  不再对同一批 `tracked_edges` 做一轮空转的 support 重算。
+- 新增 `_merge_active_candidate_edges()` 与 `_merge_new_frontier_edges()`，
+  先过滤掉不满足 `k_mask / evicted_mask / visited_mask` 的边，再做 `unique`，
+  减少无效候选边进入后续传播。
+- 删除侧当前版本也缓存了 `k_mask = (truss_result == k)`，
+  避免 `removal_traverse()` 每轮重复构造整图级布尔条件。
+- 插入侧曾尝试更激进的增量 `ts` 扣减，但会破坏正确性，已回退，未保留。
+
+7. 通用状态复用
+- 维护循环中复用 `edge_code` 与 `bidirectional_view`，避免每轮重新 `_build_edge_index()` 或 `_build_bidirectional_view()`。
+- `insert_edges_csr()` / `remove_edges_csr()` 直接返回新的 `edge_code`，供下一轮维护继续使用。
+
+8. 测试与输出
+- `test.py` 已改为支持：
+  自动 warmup、多次测量、CUDA 同步、输出 runs/mean/median。
+- `test.py` 输出已收敛，只打印：
+  原始 truss 分解摘要、删除维护结果、插入维护结果、最终一致性和时间统计。
+- `superior_remove(..., return_stats=True)` / `superior_insert(..., return_stats=True)`
+  现可返回遍历统计信息。
+- `test.py` 现会额外输出：
+  删除和插入各自的 `traverse summed unique edge count` 与 `traverse total edge visits`，
+  便于判断传播阶段的真实工作量。
+- 底层打印已默认关闭：
+  `calculate_time` 装饰器输出、
+  `truss_decomposition()` 内部调试输出。
+
+9. 当前版本在 `facebook.txt + facebook_10.txt` 上的典型结果
+- 正确性：
+  `delete maintenance == recomputed True`
+  `insert maintenance == recomputed True`
+  `final graph == original graph True`
+  `final truss == original truss True`
+- 性能（一次近期稳定测试）：
+  原始分解约 2.53s
+  删除维护约 0.32s
+  插入维护约 0.70~0.74s
+- 遍历规模（一次近期单次测试）：
+  删除 traverse summed unique edge count: 1446
+  删除 traverse total edge visits: 2077
+  插入 traverse summed unique edge count: 9111
+  插入 traverse total edge visits: 51814

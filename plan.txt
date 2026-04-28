@@ -1,0 +1,61 @@
+基于 PyTorch 的 workflow.pdf 动态 Truss 维护实现计划
+摘要
+新实现放在 truss/ 体系内，完全忽略 dcd_maintain/，但复用现有 truss/ 与 TETree/ 中已经验证过的张量式 CSR、局部三角枚举和全量分解能力。
+主路径采用“CPU 常驻图状态 + GPU 只处理候选锥局部张量”的设计，保证纯 PyTorch 张量实现、较高并行度和更好的可移植性。
+v1 直接覆盖 workflow.pdf 的边插入/删除与顶点插入/删除；顶点更新统一规范化为 incident 边的批更新。
+不在新引擎里依赖 torch_scatter、自定义 CUDA 扩展或全图三角倒排；全图三角只允许作为 bootstrap/oracle 的离线路径存在。
+关键实现变更
+在 truss/ 新建统一状态对象 TensorTrussState，替代现有 TrussFile 的小图导向设计：
+持久化 row_ptr:int64、columns:int32、rev_row_ptr:int64、rev_columns:int32、rev_edge_ids:int32、truss:int32、vertex_ids。
+不持久化 source_edge/left_edge/right_edge 这类全图三角数组；它们只在 bootstrap 或局部维护时临时生成。
+快照改为目录式分片保存，每个大 tensor 单独 torch.save，避免单个超大 .pt 文件。
+把现有可复用能力抽成运行时层，来源优先是 truss/insert_maintenace.py 与 truss/updated_graph.py：
+直接复用或迁移 _build_edge_index、_build_edge_src_index、_expand_ranges、_map_ids_to_local、insert_edges_csr、remove_edges_csr。
+_collect_edge_triangles 保留当前 searchsorted 交集思路，但拆成“局部双向邻接装配 + 三角收集”两步，支持 CPU 常驻图、GPU 分块求交。
+去掉所有硬编码 off=... 的 pair-hash，统一改为 int64 的 edge_code = u * num_vertices + v。
+新维护主线只使用 torch.searchsorted、torch.bincount、torch.cumsum、torch.repeat_interleave、scatter_reduce_ 等原生 PyTorch 原语。
+新增统一入口 maintain_truss(state, delta, *, device, edge_budget, triangle_budget)：
+normalize_updates 先把顶点增删展开成边批更新，去重、规范化 u < v，并按“先删后插”排序。
+删除阶段在旧图上收集失效三角，得到 delta_minus；插入阶段在“删后图 + 临时 overlay”上收集新增三角，得到 delta_plus。
+候选锥 cone 定义为：更新边 + 所有变化三角涉及的边；传播阶段对 interval 收紧的边做保守一跳三角邻边扩张，只有 L<U 仍未闭合时才触发二跳 backfill。
+在 cone 上初始化 tau, L, U, delta_plus, delta_minus, cand, active, fixed, last_mark。
+按 workflow.pdf 顺序执行：
+A_delete 只允许收缩 U
+B_insert 先收缩 U，再提升 L
+PickCriticalK 采用“按唯一 k 分桶的批二分”，不允许逐边 Python 循环。
+smin/smax 一律由局部三角 pack + L/U mask 通过 bincount 批量计算；每次 tighten 后只回灌三角邻边，不重新扫整图。
+当 L == U 时冻结边并写回 tau_new；所有活跃边收敛后提交到状态。
+W_hard/W_soft 不做全局数组化实现，而是做“cone 内局部 witness cache”：
+结构采用 CSR-like ragged pack，只缓存当前活跃 cone 的三角见证。
+L/U 收紧时先做 mask 重分类；只有仍 unresolved 的边才回扫残余局部三角。
+这样保留 workflow.pdf 的缓存思想，但避免数亿边场景下的全局 witness 内存爆炸。
+保留兼容入口：
+superior_insert / superior_remove 改成 maintain_truss 的薄包装，现有脚本调用方式不变。
+truss_save6_2.calculate_support3 + truss_decomposition 仅作为初始化全量分解和正确性 oracle，不再进入在线维护主路径。
+TETree-special-optimized/ 与 dcd_maintain/ 都不进入新实现依赖链。
+公开接口与状态格式
+TensorTrussState.save(snapshot_dir) / TensorTrussState.load(snapshot_dir)
+build_state_from_text(graph_file, snapshot_dir, *, with_reverse_csr=True)
+normalize_updates(state, delta)
+delta.ins_edges
+delta.del_edges
+delta.add_vertices
+delta.remove_vertices
+maintain_truss(state, delta, *, device='cuda'|'cpu', edge_budget, triangle_budget) -> (new_state, stats)
+测试与验收
+正确性：
+用 update_g/facebook_10.txt、facebook_100.txt、amazon_*、dblp_* 做插入、删除、混合更新。
+每次都对比全量重分解结果，要求 truss 完全一致。
+顶点更新：
+构造“顶点加入/移除”样例，并验证其结果与显式 incident 边批更新完全一致。
+设备一致性：
+同一批更新在 CPU/CUDA 上输出完全一致。
+规模行为：
+用高 degree synthetic graph 验证 edge_budget/triangle_budget 生效，GPU 峰值内存随 cone 而非随全图增长。
+快照一致性：
+维护前后 save/load 循环不改变图结构、truss 和顶点映射。
+默认假设
+无向边在 canonical CSR 中只存一次，始终满足 u < v；双向访问通过 reverse CSR 和局部装配完成。
+混合批更新固定解释为“先删后插”，不做用户可配置顺序。
+每次批更新提交后允许重新压实 eid；稳定外部标识是 (u,v) 的 edge_code，不是瞬时 eid。
+文本图输入只作为兼容入口；面向数亿边的正式运行路径使用新的张量快照/分片格式。
