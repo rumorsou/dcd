@@ -259,9 +259,16 @@ def _solve_cone_exact(
     *,
     edge_budget: int | None = None,
     profile: DCDProfileCounters | None = None,
+    active_only: bool = False,
 ) -> tuple[torch.Tensor, TrianglePack, bool]:
     tau_new = bound.tau_base.clone().to(torch.int32)
-    cone_edges = torch.nonzero(bound.cand, as_tuple=False).flatten()
+    if active_only:
+        fixed_edges = torch.nonzero(bound.cand & (bound.lower == bound.upper), as_tuple=False).flatten()
+        if fixed_edges.numel() > 0:
+            tau_new[fixed_edges] = bound.lower[fixed_edges].to(torch.int32)
+        cone_edges = torch.nonzero(bound.cand & (bound.lower < bound.upper), as_tuple=False).flatten()
+    else:
+        cone_edges = torch.nonzero(bound.cand, as_tuple=False).flatten()
     if profile is not None:
         profile.num_exact_peeling_edges = int(cone_edges.numel())
     if cone_edges.numel() == 0:
@@ -401,6 +408,7 @@ def maintain_dcd(
             bound,
             edge_budget=edge_budget,
             profile=profile_counters,
+            active_only=normalized.del_edges.numel() == 0 and normalized.ins_edges.numel() > 0,
         )
         new_state.tau = tau_new
         profile_counters.num_cone_edges = int(bound.cone_edges.numel())
