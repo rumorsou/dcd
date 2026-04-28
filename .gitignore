@@ -27,6 +27,8 @@ Thumbs.db
 # Local experiment outputs
 /new_dcd_benchmark*.csv
 /new_dcd_vs*.csv
+/new_dcd_profile*.csv
+/baseline*.csv
 /test_export.*
 /tmp_parity.pptx
 
