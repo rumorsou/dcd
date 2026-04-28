@@ -135,7 +135,10 @@ class DCDResult:
 
 
 def pick_critical_k(lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
-    return torch.div(lower.to(torch.long) + upper.to(torch.long) + 1, 2, rounding_mode="floor").to(torch.int32)
+    gap = upper.to(torch.long) - lower.to(torch.long)
+    midpoint = torch.div(lower.to(torch.long) + upper.to(torch.long) + 1, 2, rounding_mode="floor")
+    upper_first = upper.to(torch.long)
+    return torch.where(gap <= 2, upper_first, midpoint).to(torch.int32)
 
 
 def _expand_cone(
@@ -175,9 +178,25 @@ def _propagate_and_backfill(
 ) -> torch.Tensor:
     if tightened_edges.numel() == 0:
         return torch.empty((0,), device=index.state.device, dtype=torch.long)
-    neighbors = index.triangle_neighbors(tightened_edges, edge_budget=edge_budget)
-    if neighbors.numel() == 0:
-        return neighbors
+    pack = index.materialize(tightened_edges)
+    if profile is not None:
+        profile.record_pack_scan(pack)
+    if pack.other_edges.numel() == 0:
+        return torch.empty((0,), device=index.state.device, dtype=torch.long)
+
+    other = pack.other_edges.to(torch.long)
+    left = other[:, 0]
+    right = other[:, 1]
+    left_may_affect = (bound.lower[left] < bound.upper[left]) & (bound.upper[right] >= bound.lower[left])
+    right_may_affect = (bound.lower[right] < bound.upper[right]) & (bound.upper[left] >= bound.lower[right])
+    parts = []
+    if torch.any(left_may_affect):
+        parts.append(left[left_may_affect])
+    if torch.any(right_may_affect):
+        parts.append(right[right_may_affect])
+    if not parts:
+        return torch.empty((0,), device=index.state.device, dtype=torch.long)
+    neighbors = torch.unique(torch.cat(parts), sorted=True)
     if profile is not None:
         profile.num_enqueue_total += int(neighbors.numel())
     unseen = neighbors[~bound.cand[neighbors]]
@@ -211,18 +230,58 @@ def _run_phase(
         pack = index.materialize(active_edges)
         if profile is not None:
             profile.record_pack_scan(pack, level=round_id)
-        k_values = pick_critical_k(bound.lower[pack.edge_ids], bound.upper[pack.edge_ids])
-        smin, smax = estimate_support_bounds(pack, k_values, bound.lower, bound.upper)
         old_lower = bound.lower[pack.edge_ids].clone()
         old_upper = bound.upper[pack.edge_ids].clone()
 
-        down = smax < (k_values.to(torch.long) - 2)
+        upper_k = old_upper.to(torch.int32)
+        _, upper_smax = estimate_support_bounds(pack, upper_k, bound.lower, bound.upper)
+        down = upper_smax < (upper_k.to(torch.long) - 2)
         if torch.any(down):
-            bound.upper[pack.edge_ids[down]] = torch.minimum(bound.upper[pack.edge_ids[down]], (k_values[down] - 1).to(torch.int32))
+            bound.upper[pack.edge_ids[down]] = torch.minimum(
+                bound.upper[pack.edge_ids[down]],
+                (upper_k[down] - 1).to(torch.int32),
+            )
         if allow_raise_lower:
-            up = smin >= (k_values.to(torch.long) - 2)
+            lower_k = torch.minimum(bound.lower[pack.edge_ids] + 1, bound.upper[pack.edge_ids]).to(torch.int32)
+            lower_smin, _ = estimate_support_bounds(pack, lower_k, bound.lower, bound.upper)
+            up = (lower_k > bound.lower[pack.edge_ids]) & (lower_smin >= (lower_k.to(torch.long) - 2))
             if torch.any(up):
-                bound.lower[pack.edge_ids[up]] = torch.maximum(bound.lower[pack.edge_ids[up]], k_values[up])
+                bound.lower[pack.edge_ids[up]] = torch.maximum(bound.lower[pack.edge_ids[up]], lower_k[up])
+
+        unchanged = (bound.lower[pack.edge_ids] == old_lower) & (bound.upper[pack.edge_ids] == old_upper)
+        wide = (old_upper - old_lower) > 2
+        mid_candidates = unchanged & wide
+        if torch.any(mid_candidates):
+            mid_edges = pack.edge_ids[mid_candidates]
+            mid_pack = TrianglePack(
+                mid_edges,
+                torch.cat(
+                    (
+                        torch.zeros((1,), device=pack.edge_ids.device, dtype=torch.long),
+                        (pack.tri_ptr[1:] - pack.tri_ptr[:-1])[mid_candidates].cumsum(0),
+                    )
+                ),
+                pack.other_edges[
+                    torch.repeat_interleave(mid_candidates, pack.tri_ptr[1:] - pack.tri_ptr[:-1])
+                ],
+                None
+                if pack.third_vertex is None
+                else pack.third_vertex[
+                    torch.repeat_interleave(mid_candidates, pack.tri_ptr[1:] - pack.tri_ptr[:-1])
+                ],
+            )
+            mid_k = pick_critical_k(old_lower[mid_candidates], old_upper[mid_candidates])
+            mid_smin, mid_smax = estimate_support_bounds(mid_pack, mid_k, bound.lower, bound.upper)
+            mid_down = mid_smax < (mid_k.to(torch.long) - 2)
+            if torch.any(mid_down):
+                bound.upper[mid_edges[mid_down]] = torch.minimum(
+                    bound.upper[mid_edges[mid_down]],
+                    (mid_k[mid_down] - 1).to(torch.int32),
+                )
+            if allow_raise_lower:
+                mid_up = mid_smin >= (mid_k.to(torch.long) - 2)
+                if torch.any(mid_up):
+                    bound.lower[mid_edges[mid_up]] = torch.maximum(bound.lower[mid_edges[mid_up]], mid_k[mid_up])
         bound.lower[pack.edge_ids] = torch.minimum(bound.lower[pack.edge_ids], bound.upper[pack.edge_ids])
 
         if profile is not None:
